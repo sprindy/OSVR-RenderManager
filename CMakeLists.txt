@@ -36,6 +36,12 @@ if(EXISTS "${AMD_SRC_DIR}/RenderManagerAMDD3D.cpp")
 	set(HAVE_AMD_NDA_SUBMODULE TRUE)
 endif()
 
+set(INTEL_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/osvr/RenderKit/NDA/OSVR-RenderManager-Intel")
+set(HAVE_INTEL_NDA_SUBMODULE FALSE)
+if(EXISTS "${INTEL_SRC_DIR}/RenderManagerIntelD3D.cpp")
+	set(HAVE_INTEL_NDA_SUBMODULE TRUE)
+endif()
+
 # Add one of these libraries for each vendor that we've got a driver
 # for and add a No driver that tells that it is unavailable when we
 # don't find the driver library.
@@ -127,6 +133,20 @@ else()
 	message(STATUS " - AMD direct support: disabled (need LIQUIDVR and AMD NDA submodule)")
 endif()
 
+if (HAVE_INTEL_NDA_SUBMODULE)
+	# Usage dependencies
+	add_library(osvrRM-intel-requirements INTERFACE)
+	target_include_directories(osvrRM-inteld-requirements INTERFACE "${INTEL_SRC_DIR}")
+	# Intel NDA files.
+	list(APPEND RenderManager_SOURCES
+		"${INTEL_SRC_DIR}/RenderManagerIntelD3D.cpp"
+		"${INTEL_SRC_DIR}/RenderManagerIntelD3D.h")
+	set(RM_USE_INTEL_DIRECT_D3D11 TRUE)
+	message(STATUS " - Intel direct D3D11 support: enabled (found Intel NDA submodule)")
+else()
+	message(STATUS " - Intel direct support: disabled (need Intel NDA submodule)")
+endif()
+
 #-----------------------------------------------------------------------------
 # OpenGL library as a stand-alone renderer not wrapping D3D
 if ( ( (OPENGL_FOUND AND GLEW_FOUND) OR OPENGLES2_FOUND ) AND SDL2_FOUND)
@@ -144,11 +164,11 @@ endif()
 
 #-----------------------------------------------------------------------------
 # OpenGL wrapped around Direct3D
-if ((RM_USE_NVIDIA_DIRECT_D3D11 OR RM_USE_AMD_DIRECT_D3D11) AND NOT RM_USE_OPENGLES20)
+if ((RM_USE_NVIDIA_DIRECT_D3D11 OR RM_USE_AMD_DIRECT_D3D11 OR RM_USE_INTEL_DIRECT_D3D11)) AND NOT RM_USE_OPENGLES20)
 	#-----------------------------------------------------------------------------
 	# OpenGL library as a wrapper for D3D DirectMode
 	if (OPENGL_FOUND AND GLEW_FOUND AND SDL2_FOUND)
-		message(STATUS " - D3D11+OpenGL support: enabled (found NVAPI or LIQUIDVR, OpenGL, GLEW, and SDL2)")
+		message(STATUS " - D3D11+OpenGL support: enabled (found NVAPI or LIQUIDVR or Intel DirectMode, OpenGL, GLEW, and SDL2)")
 		list(APPEND RenderManager_SOURCES osvr/RenderKit/RenderManagerD3DOpenGL.cpp osvr/RenderKit/RenderManagerD3DOpenGL.h)
 		set(RM_USE_NVIDIA_DIRECT_D3D11_OPENGL TRUE)
 	else()
@@ -235,6 +255,11 @@ if (RM_USE_AMD_DIRECT_D3D11)
 	target_link_libraries(osvrRenderManager
 		PRIVATE
 		osvrRM-amd-requirements)
+endif()
+if (RM_USE_INTEL_DIRECT_D3D11)
+	target_link_libraries(osvrRenderManager
+		PRIVATE
+		osvrRM-intel-requirements)
 endif()
 if (WIN32)
 	target_link_libraries(osvrRenderManager PRIVATE D3D11)
