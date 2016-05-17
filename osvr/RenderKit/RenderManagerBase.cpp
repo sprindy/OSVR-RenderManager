@@ -43,6 +43,10 @@ Russ Taylor <russ@sensics.com>
 #include "RenderManagerAMDD3D.h"
 #endif
 
+#ifdef RM_USE_INTEL_DIRECT_D3D11
+#include "RenderManagerIntelD3D.h"
+#endif
+
 #ifdef RM_USE_OPENGL
 #include "RenderManagerOpenGL.h"
 #endif
@@ -2382,7 +2386,7 @@ namespace renderkit {
       )
     {
       RenderManagerD3D11Base *ret = nullptr;
-#if defined(RM_USE_NVIDIA_DIRECT_D3D11) || defined(RM_USE_AMD_DIRECT_D3D11)
+#if defined(RM_USE_NVIDIA_DIRECT_D3D11) || defined(RM_USE_AMD_DIRECT_D3D11) || defined(RM_USE_INTEL_DIRECT_D3D11)
   #if defined(RM_USE_AMD_DIRECT_D3D11)
       if ((ret == nullptr) && RenderManagerAMDD3D11::DirectModeAvailable() ) {
         // See if we have an AMD card.  This is done by
@@ -2397,6 +2401,15 @@ namespace renderkit {
   #endif
   #if defined(RM_USE_NVIDIA_DIRECT_D3D11)
       if ((ret == nullptr) && RenderManagerNVidiaD3D11::DirectModeAvailable() ) {
+        ret = new RenderManagerNVidiaD3D11(context, params);
+        if (!ret->doingOkay()) {
+          delete ret;
+          ret = nullptr;
+        }
+      }
+  #endif
+  #if defined(RM_USE_INTEL_DIRECT_D3D11)
+      if (ret == nullptr) {
         ret = new RenderManagerNVidiaD3D11(context, params);
         if (!ret->doingOkay()) {
           delete ret;

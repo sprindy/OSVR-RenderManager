@@ -136,7 +136,7 @@ endif()
 if (HAVE_INTEL_NDA_SUBMODULE)
 	# Usage dependencies
 	add_library(osvrRM-intel-requirements INTERFACE)
-	target_include_directories(osvrRM-inteld-requirements INTERFACE "${INTEL_SRC_DIR}")
+	target_include_directories(osvrRM-intel-requirements INTERFACE "${INTEL_SRC_DIR}")
 	# Intel NDA files.
 	list(APPEND RenderManager_SOURCES
 		"${INTEL_SRC_DIR}/RenderManagerIntelD3D.cpp"
@@ -164,7 +164,7 @@ endif()
 
 #-----------------------------------------------------------------------------
 # OpenGL wrapped around Direct3D
-if ((RM_USE_NVIDIA_DIRECT_D3D11 OR RM_USE_AMD_DIRECT_D3D11 OR RM_USE_INTEL_DIRECT_D3D11)) AND NOT RM_USE_OPENGLES20)
+if ((RM_USE_NVIDIA_DIRECT_D3D11 OR RM_USE_AMD_DIRECT_D3D11 OR RM_USE_INTEL_DIRECT_D3D11) AND NOT RM_USE_OPENGLES20)
 	#-----------------------------------------------------------------------------
 	# OpenGL library as a wrapper for D3D DirectMode
 	if (OPENGL_FOUND AND GLEW_FOUND AND SDL2_FOUND)
