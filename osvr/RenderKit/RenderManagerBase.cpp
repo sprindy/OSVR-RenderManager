@@ -2410,7 +2410,7 @@ namespace renderkit {
   #endif
   #if defined(RM_USE_INTEL_DIRECT_D3D11)
       if (ret == nullptr) {
-        ret = new RenderManagerNVidiaD3D11(context, params);
+        ret = new RenderManagerIntelD3D11(context, params);
         if (!ret->doingOkay()) {
           delete ret;
           ret = nullptr;
