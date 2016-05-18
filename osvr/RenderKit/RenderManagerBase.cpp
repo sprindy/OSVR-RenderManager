@@ -2847,6 +2847,7 @@ namespace renderkit {
                 if (host == nullptr) {
                   std::cerr << "createRenderManager: Could not open the"
                     << " requested harnessed DirectMode display" << std::endl;
+                  return nullptr;
                 }
 
                 ret.reset(
