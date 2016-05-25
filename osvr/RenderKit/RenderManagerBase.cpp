@@ -792,6 +792,13 @@ namespace renderkit {
 
                 ++count;
             } while (!proceed);
+            /*
+            static int loops = 0;
+            if (++loops == 60) {
+              std::cout << "XXX Vsync wait spent " << count << " iterations waiting" << std::endl;
+              loops = 0;
+            }
+            */
         }
 
         // Use the current and previous parameters to construct info
