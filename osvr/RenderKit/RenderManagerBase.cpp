@@ -2204,8 +2204,10 @@ namespace renderkit {
 
         // Check and see if the render manager is doing okay.  If not, return
         // nullptr after deleting it.
-        if (!ret->doingOkay()) {
-            return nullptr;
+        if ((ret == nullptr) || !ret->doingOkay()) {
+          if (m_log) m_log->error() << "createRenderManager: Broken RenderManager: "
+            << p.m_renderLibrary;
+          return nullptr;
         }
 
         // Return the render manager.
