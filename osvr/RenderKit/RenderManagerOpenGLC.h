@@ -26,10 +26,26 @@
 #define INCLUDED_RenderManagerOpenGLC_h_GUID_362705F9_1D6B_468E_3532_B813F7AB50C6
 
 // Internal Includes
+#include <RenderManagerBackends.h>
 #include <osvr/RenderKit/RenderManagerC.h>
 
 // Library/third-party includes
-//#include <GL/GL.h>
+#include <osvr/Util/PlatformConfig.h>
+#if defined(OSVR_WINDOWS)
+#include <windows.h>
+#endif
+
+#ifdef RM_USE_OPENGLES20
+// @todo This presumes we're compiling on Android.
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+#else
+#if defined(OSVR_MACOSX)
+#include <OpenGL/gl3.h>
+#else
+#include <GL/gl.h>
+#endif
+#endif
 
 // Standard includes
 // - none
@@ -38,13 +54,47 @@ OSVR_EXTERN_C_BEGIN
 
 typedef void* OSVR_RenderManagerOpenGL;
 
+typedef struct OSVR_OpenGLContextParams {
+    const char* windowTitle;
+    OSVR_CBool fullScreen;
+    int width;
+    int height;
+    int xPos;
+    int yPos;
+    int bitsPerPixel;
+    unsigned numBuffers;
+    OSVR_CBool visible;
+} OSVR_OpenGLContextParams;
+
+typedef struct OSVR_OpenGLToolkitFunctions {
+    // Should be set to sizeof(OSVR_OpenGLToolkitFunctions) to allow the library
+    // to detect when the client was compiled against an older version which has
+    // fewer members in this struct.
+    size_t size;
+
+    // Pointer which will be passed to all the functions.  Often used
+    // by static class functions to find out a pointer to the class
+    // instance object.
+    void* data;
+
+    // Functions implementing the toolkit functionality
+    void (*create)(void* data);
+    void (*destroy)(void* data);
+    OSVR_CBool (*addOpenGLContext)(void* data, const OSVR_OpenGLContextParams* p);
+    OSVR_CBool (*removeOpenGLContexts)(void* data);
+    OSVR_CBool (*makeCurrent)(void* data, size_t display);
+    OSVR_CBool (*swapBuffers)(void* data, size_t display);
+    OSVR_CBool (*setVerticalSync)(void* data, OSVR_CBool verticalSync);
+    OSVR_CBool (*handleEvents)(void* data);
+} OSVR_OpenGLToolkitFunctions;
+
 typedef struct OSVR_GraphicsLibraryOpenGL {
-    // intentionally left blank
+    const OSVR_OpenGLToolkitFunctions* toolkit;
 } OSVR_GraphicsLibraryOpenGL;
 
 typedef struct OSVR_RenderBufferOpenGL {
-    // GLuint colorBufferName;
-    // GLuint depthStencilBufferName;
+     GLuint colorBufferName;
+     GLuint depthStencilBufferName;
 } OSVR_RenderBufferOpenGL;
 
 typedef struct OSVR_RenderInfoOpenGL {
@@ -85,6 +135,12 @@ OSVR_RENDERMANAGER_EXPORT OSVR_ReturnCode
 osvrRenderManagerRegisterRenderBufferOpenGL(
     OSVR_RenderManagerRegisterBufferState registerBufferState,
     OSVR_RenderBufferOpenGL renderBuffer);
+
+/// Gets a given OSVR_RenderInfoOpenGL from an OSVR_RenderInfoCollection.
+OSVR_RENDERMANAGER_EXPORT OSVR_ReturnCode osvrRenderManagerGetRenderInfoFromCollectionOpenGL(
+    OSVR_RenderInfoCollection renderInfoCollection,
+    OSVR_RenderInfoCount index,
+    OSVR_RenderInfoOpenGL* renderInfoOut);
 
 OSVR_EXTERN_C_END
 

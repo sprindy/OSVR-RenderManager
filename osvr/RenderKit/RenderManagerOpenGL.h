@@ -28,6 +28,7 @@ Sensics, Inc.
 #include <osvr/ClientKit/Interface.h>
 #include "RenderManager.h"
 #include <RenderManagerBackends.h>
+#include "RenderManagerOpenGLC.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -35,7 +36,6 @@ Sensics, Inc.
 
 #ifdef RM_USE_OPENGLES20
   // @todo This presumes we're compiling on Android.
-  #include <SDL.h>
   #include <GLES2/gl2.h>
   #include <GLES2/gl2ext.h>
 
@@ -68,8 +68,6 @@ Sensics, Inc.
   #else
     #include <GL/gl.h>
   #endif
-  #include <SDL.h>
-  #include <SDL_opengl.h>
 #endif
 
 #include <stdlib.h>
@@ -109,7 +107,6 @@ namespace renderkit {
         class GLContextParams {
           public:
             std::string windowTitle; //< Window title
-            int displayIndex;        //< Which display to use (-1 = any)?
             bool fullScreen;         //< Do we want full screen?
             int width;               //< If not full screen, how wide?
             int height;              //< If not full screen, how high?
@@ -120,7 +117,6 @@ namespace renderkit {
             bool visible;            //< Should the window be initially visible?
             GLContextParams() {
                 windowTitle = "OSVR";
-                displayIndex = -1;
                 fullScreen = false;
                 width = 640;
                 height = 480;
@@ -131,8 +127,10 @@ namespace renderkit {
                 visible = true;
             }
         };
-        bool addOpenGLContext(GLContextParams p);
-        bool removeOpenGLContexts();
+        OSVR_OpenGLToolkitFunctions m_toolkit;  //< OpenGL windowing toolkit to use
+
+        /// Delete m_programId in destructor.
+        void deleteProgram();
 
         /// Construct the buffers we're going to use in Render() mode, which
         /// we use to actually use the Presentation mode.  This gives us the
@@ -141,17 +139,6 @@ namespace renderkit {
         /// size we need for Asychronous Time Warp and distortion, and keeps
         /// them from being in the same window and so bleeding together.
         bool constructRenderBuffers();
-
-        // Classes and structures needed to do our rendering.
-        bool m_sdl_initialized = false;
-        class DisplayInfo {
-          public:
-            SDL_Window* m_window = nullptr; //< The window we're rendering into
-        };
-        std::vector<DisplayInfo> m_displays;
-
-        SDL_GLContext
-            m_GLContext; //< The context we use to render to all displays
 
         // Special vertex/fragment shader information for our shader that
         // handles
@@ -162,25 +149,46 @@ namespace renderkit {
         GLuint
             m_modelViewUniformId; //< Pointer to modelView matrix, vertex shader
         GLuint m_textureUniformId; //< Pointer to texture matrix, vertex shader
-        GLuint m_frameBuffer;      //< Groups a color buffer and a depth buffer
+
+        std::vector<GLuint> m_frameBuffers;      //< Groups a color buffer and a depth buffer (per display)
 
         std::vector<RenderBuffer>
             m_colorBuffers; //< Color buffers to hand to render callbacks
         std::vector<GLuint> m_depthBuffers; //< Depth/stencil buffers to hand to
                                             /// render callbacks
 
+        struct DistortionVertex {
+            GLfloat pos[4];
+            GLfloat texRed[2];
+            GLfloat texGreen[2];
+            GLfloat texBlue[2];
+        };
+
+        struct DistortionMeshBuffer {
+
+            // Needed for making the proper context current in the destructor.
+            RenderManagerOpenGL* renderManager;
+            size_t display;
+
+            GLuint VAO;
+            GLuint vertexBuffer;
+            GLuint indexBuffer;
+            std::vector<DistortionVertex> vertices;
+            std::vector<uint16_t> indices;
+
+            DistortionMeshBuffer();
+            DistortionMeshBuffer(DistortionMeshBuffer && rhs);
+            ~DistortionMeshBuffer();
+            DistortionMeshBuffer & operator=(DistortionMeshBuffer && rhs);
+
+            void Clear();
+        };
+
         // Vertex/texture coordinate buffer to render into final windows, one
         // per eye
         // @todo One per eye/display combination in case of multiple displays
         // per eye
-        std::vector<GLuint>
-            m_distortBuffer; //< Buffer objects to point to geometry to render
-        std::vector<GLuint>
-            m_distortVAO; //< Vertex array objects for the geometry to render
-        std::vector<GLfloat*>
-            m_triangleBuffer; //< Pointer to our triangle array buffers
-        std::vector<size_t>
-            m_numTriangles; //< Number of triangles in our array buffers
+        std::vector<DistortionMeshBuffer> m_distortionMeshBuffer;
 
         //===================================================================
         // Overloaded render functions from the base class.
@@ -205,8 +213,23 @@ namespace renderkit {
         bool PresentFrameInitialize() override { return true; }
         bool PresentDisplayInitialize(size_t display) override;
         bool PresentEye(PresentEyeParameters params) override;
+        bool SolidColorEye(size_t eye, const RGBColorf &color) override;
         bool PresentDisplayFinalize(size_t display) override;
         bool PresentFrameFinalize() override;
+
+        inline void ConvertContextParams(
+          const osvr::renderkit::RenderManagerOpenGL::GLContextParams& contextParams,
+          OSVR_OpenGLContextParams& contextParamsOut) {
+          contextParamsOut.windowTitle = contextParams.windowTitle.c_str();
+          contextParamsOut.fullScreen = contextParams.fullScreen;
+          contextParamsOut.width = contextParams.width;
+          contextParamsOut.height = contextParams.height;
+          contextParamsOut.xPos = contextParams.xPos;
+          contextParamsOut.yPos = contextParams.yPos;
+          contextParamsOut.bitsPerPixel = contextParams.bitsPerPixel;
+          contextParamsOut.numBuffers = contextParams.numBuffers;
+          contextParamsOut.visible = contextParams.visible;
+        }
 
         /// See if we had an OpenGL error
         /// @return True if there is an error, false if not.

@@ -83,7 +83,9 @@ namespace renderkit {
         m_buffers.OpenGL = nullptr;
         delete m_library.OpenGL;
         m_library.OpenGL = nullptr;
-        removeOpenGLContexts();
+        if (m_toolkit.removeOpenGLContexts) {
+          m_toolkit.removeOpenGLContexts(m_toolkit.data);
+        }
     }
 
     RenderManager::OpenResults RenderManagerD3D11OpenGL::OpenDisplay(void) {
@@ -106,16 +108,23 @@ namespace renderkit {
         // RenderBuffer names.
         GLContextParams p;
         p.visible = false; // Make the context invisible, to not distract
-        if (!addOpenGLContext(p)) {
-            if (m_log) m_log->error() << "RenderManagerD3D11OpenGL::OpenDisplay: Can't open GL "
-                         "context";
+        OSVR_OpenGLContextParams pC;
+        ConvertContextParams(p, pC);
+        if (!m_toolkit.addOpenGLContext ||
+            !m_toolkit.addOpenGLContext(m_toolkit.data, &pC)) {
+            if (m_log) m_log->error() <<
+	              "RenderManagerD3D11OpenGL::OpenDisplay: Can't open GL "
+                      "context";
             return ret;
         }
         glewExperimental = true; // Needed for core profile
         if (glewInit() != GLEW_OK) {
-            removeOpenGLContexts();
-            if (m_log) m_log->error() << "RenderManagerD3D11OpenGL::OpenDisplay: Can't "
-                         "initialize GLEW";
+          if (m_toolkit.removeOpenGLContexts) {
+            m_toolkit.removeOpenGLContexts(m_toolkit.data);
+          }
+          if (m_log) m_log->error() <<
+	              "RenderManagerD3D11OpenGL::OpenDisplay: Can't "
+                      "initialize GLEW";
             return ret;
         }
 
@@ -168,7 +177,7 @@ namespace renderkit {
             "RenderManagerD3D11OpenGL::RenderEyeInitialize beginning");
 
         // Attach the Direct3D buffers to our framebuffer object
-        glBindFramebuffer(GL_FRAMEBUFFER, m_frameBuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, m_frameBuffers[GetDisplayUsedByEye(eye)]);
         checkForGLError(
             "RenderManagerD3D11OpenGL::RenderEyeInitialize BindFrameBuffer");
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -465,18 +474,16 @@ namespace renderkit {
           }
         }
         if (oglMap == nullptr) {
-          std::cerr
+          if (m_log) m_log->error()
             << "RenderManagerD3D11OpenGL::PresentRenderBuffersInternal(): Unregistered buffer"
-            << " (call RegisterRenderBuffers before presenting)"
-            << std::endl;
+            << " (call RegisterRenderBuffers before presenting)";
           return false;
         }
         if (renderBuffers[b].OpenGL->colorBufferName != oglMap->OpenGLTexture) {
-          std::cerr
+          if (m_log) m_log->error()
             << "RenderManagerD3D11OpenGL::PresentRenderBuffersInternal(): Mis-matched buffer"
             << " (call RegisterRenderBuffers whenever a new render-texture "
-            "is created)"
-            << std::endl;
+            "is created)";
           return false;
         }
         RenderBuffer rb;

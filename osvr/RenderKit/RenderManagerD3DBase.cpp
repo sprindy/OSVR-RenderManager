@@ -23,8 +23,10 @@ Sensics, Inc.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <osvr/Util/Finally.h>
 #include "RenderManagerD3DBase.h"
 #include "GraphicsLibraryD3D11.h"
+#include "ComputeDistortionMesh.h"
 #include <boost/assert.hpp>
 #include <iostream>
 #include <DirectXMath.h>
@@ -147,16 +149,12 @@ namespace renderkit {
         m_library.D3D11 = new GraphicsLibraryD3D11;
         m_buffers.D3D11 = new RenderBufferD3D11;
         m_depthStencilStateForRender = nullptr;
+        m_depthStencilStateForPresent = nullptr;
     }
 
     RenderManagerD3D11Base::~RenderManagerD3D11Base() {
         // Release any prior buffers we allocated
-        for (size_t i = 0; i < m_quadVertexBuffer.size(); i++) {
-            m_quadVertexBuffer[i]->Release();
-        }
-        for (size_t i = 0; i < m_triangleBuffer.size(); i++) {
-            delete[] m_triangleBuffer[i];
-        }
+        m_distortionMeshBuffer.clear();
 
         for (size_t i = 0; i < m_renderBuffers.size(); i++) {
             m_renderBuffers[i].D3D11->colorBuffer->Release();
@@ -167,6 +165,9 @@ namespace renderkit {
         }
         if (m_depthStencilStateForRender != nullptr) {
           m_depthStencilStateForRender->Release();
+        }
+        if (m_depthStencilStateForPresent != nullptr) {
+          m_depthStencilStateForPresent->Release();
         }
 
         if (m_completionQuery) {
@@ -609,7 +610,7 @@ namespace renderkit {
         depthStencilDescription.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
         depthStencilDescription.BackFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
 
-        // Create depth stencil state and set it.
+        // Create depth stencil state for presentation.
         hr = m_D3D11device->CreateDepthStencilState(
             &depthStencilDescription, &m_depthStencilStateForPresent);
         if (FAILED(hr)) {
@@ -858,37 +859,32 @@ namespace renderkit {
         std::vector<DistortionParameters> const&
             distort //< Distortion parameters
         ) {
-        // Release any prior buffers we already allocated
-        for (size_t i = 0; i < m_quadVertexBuffer.size(); i++) {
-            m_quadVertexBuffer[i]->Release();
-        }
-        for (size_t i = 0; i < m_triangleBuffer.size(); i++) {
-            delete[] m_triangleBuffer[i];
-        }
 
-        // Clear the triangle and quad buffers
-        m_numTriangles.clear();
-        m_triangleBuffer.clear();
-        m_quadVertexBuffer.clear();
-        m_quadVertexCount.clear();
+        // Release any prior buffers we already allocated
+        m_distortionMeshBuffer.clear();
 
         HRESULT hr;
 
         // Create distortion meshes for each of the eyes.
-        size_t numEyes = m_params.m_displayConfiguration.getEyes().size();
-        for (size_t eye = 0; eye < distort.size(); eye++) {
-            m_numTriangles.push_back(0);
-            m_triangleBuffer.push_back(nullptr);
+        size_t const numEyes = GetNumEyes();
+        if (numEyes > distort.size()) {
+            if (m_log) m_log->error() << "RenderManagerD3D11Base::UpdateDistortionMesh: "
+                "Not enough distortion parameters for all eyes";
+            return false;
+        }
+
+        //size_t numEyes = m_params.m_displayConfiguration.getEyes().size();
+        m_distortionMeshBuffer.resize(numEyes);
+        for (size_t eye = 0; eye < numEyes; eye++) {
+            auto & meshBuffer = m_distortionMeshBuffer[eye];
 
             // Construct a distortion mesh for this eye using the RenderManager
             // standard, which is an OpenGL-compatible mesh.
-            std::vector<RenderManager::DistortionMeshVertex> mesh =
-                ComputeDistortionMesh(eye, type, distort[eye]);
-            m_numTriangles[eye] = mesh.size() / 3;
-            if (m_numTriangles[eye] == 0) {
-                if (m_log) m_log->error() << "RenderManagerD3D11Base::UpdateDistortionMeshesInternal: Could not "
-                             "create mesh "
-                          << "for eye " << eye;
+            DistortionMesh mesh = ComputeDistortionMesh(eye, type, distort[eye], m_params.m_renderOverfillFactor);
+            if (mesh.vertices.empty()) {
+                if (m_log) m_log->error() <<
+		   "RenderManagerD3D11Base::UpdateDistortionMeshesInternal: Could not "
+                   "create mesh for eye " << eye;
                 return false;
             }
 
@@ -897,50 +893,70 @@ namespace renderkit {
             // texture coordinate 0 at Y spatial coordinate 1 and texture
             // coordinate 1 at Y spatial coordinate -1; this is not a simple
             // inversion but  rather a remapping.
-            m_triangleBuffer[eye] =
-                new DistortionVertex[m_numTriangles[eye] * 3];
-            for (size_t tri = 0; tri < m_numTriangles[eye]; tri++) {
-                for (size_t vert = 0; vert < 3; vert++) {
-                    DistortionVertex& v = m_triangleBuffer[eye][tri * 3 + vert];
-                    v.Pos.x = mesh[3 * tri + vert].m_pos[0];
-                    v.Pos.y = mesh[3 * tri + vert].m_pos[1];
+            meshBuffer.vertices.resize(mesh.vertices.size());
+            for (size_t i = 0; i < meshBuffer.vertices.size(); i++) {
+                DistortionVertex& v = meshBuffer.vertices[i];
+                auto const & meshVertex = mesh.vertices[i];
+                v.Pos.x = meshVertex.m_pos[0];
+                v.Pos.y = meshVertex.m_pos[1];
                     v.Pos.z = 0; // Z = 0, and vertices in mesh only have 2
                                  // coordinates.
 
-                    v.TexR.x = mesh[3 * tri + vert].m_texRed[0];
-                    v.TexR.y =
-                        RenderManager::DistortionMeshVertex::flipTexCoord(
-                            mesh[3 * tri + vert].m_texRed[1]);
+                v.TexR.x = meshVertex.m_texRed[0];
+                    v.TexR.y = DistortionMeshVertex::flipTexCoord(
+                      meshVertex.m_texRed[1]);
 
-                    v.TexG.x = mesh[3 * tri + vert].m_texGreen[0];
-                    v.TexG.y =
-                        RenderManager::DistortionMeshVertex::flipTexCoord(
-                            mesh[3 * tri + vert].m_texGreen[1]);
+                v.TexG.x = meshVertex.m_texGreen[0];
+                    v.TexG.y = DistortionMeshVertex::flipTexCoord(
+                      meshVertex.m_texGreen[1]);
 
-                    v.TexB.x = mesh[3 * tri + vert].m_texBlue[0];
-                    v.TexB.y =
-                        RenderManager::DistortionMeshVertex::flipTexCoord(
-                            mesh[3 * tri + vert].m_texBlue[1]);
-                }
+                v.TexB.x = meshVertex.m_texBlue[0];
+                    v.TexB.y = DistortionMeshVertex::flipTexCoord(
+                      meshVertex.m_texBlue[1]);
             }
 
-            ID3D11Buffer* quadVertexBuffer;
-            CD3D11_BUFFER_DESC bufferDesc(
-                static_cast<UINT>(sizeof(DistortionVertex) *
-                                  m_numTriangles[eye] * 3),
+            // Copy the index data
+            meshBuffer.indices = mesh.indices;
+
+            // Create the D3D resource for the vertex buffer
+            {
+                ID3D11Buffer* vertexBuffer;
+                CD3D11_BUFFER_DESC vertexBufferDesc(
+                    static_cast<UINT>(sizeof(decltype(meshBuffer.vertices[0]))
+                                      * meshBuffer.vertices.size()),
                 D3D11_BIND_VERTEX_BUFFER);
-            D3D11_SUBRESOURCE_DATA subResData = {m_triangleBuffer[eye], 0, 0};
-            hr = m_D3D11device->CreateBuffer(&bufferDesc, &subResData,
-                                             &quadVertexBuffer);
+                D3D11_SUBRESOURCE_DATA subResData = { &meshBuffer.vertices[0], 0, 0 };
+                hr = m_D3D11device->CreateBuffer(&vertexBufferDesc, &subResData,
+                    &vertexBuffer);
             if (FAILED(hr)) {
                 if (m_log) m_log->error() << "RenderManagerD3D11Base::UpdateDistortionMeshesInternal: Could not "
                              "create vertex buffer";
                 if (m_log) m_log->error() << "  Direct3D error type: " << StringFromD3DError(hr);
                 return false;
             }
-            m_quadVertexCount.push_back(
-                static_cast<UINT>(m_numTriangles[eye] * 3));
-            m_quadVertexBuffer.push_back(quadVertexBuffer);
+                meshBuffer.vertexBuffer.Attach(vertexBuffer);
+                vertexBuffer = nullptr; // Attach took ownership
+            }
+
+            // Create the D3D resource for the index buffer
+            {
+                ID3D11Buffer* indexBuffer;
+                CD3D11_BUFFER_DESC indexBufferDesc(
+                    static_cast<UINT>(sizeof(decltype(meshBuffer.indices[0]))
+                                      * meshBuffer.indices.size()),
+                    D3D11_BIND_INDEX_BUFFER);
+                D3D11_SUBRESOURCE_DATA subResData = { &meshBuffer.indices[0], 0, 0 };
+                hr = m_D3D11device->CreateBuffer(&indexBufferDesc, &subResData, &indexBuffer);
+                if (FAILED(hr)) {
+                    if (m_log) m_log->error() << "RenderManagerD3D11Base::UpdateDistortionMeshesInternal: Could not "
+                        "create index buffer";
+                    if (m_log) m_log->error() << "  Direct3D error type: "
+                      << StringFromD3DError(hr);
+                    return false;
+                }
+                meshBuffer.indexBuffer.Attach(indexBuffer);
+                indexBuffer = nullptr; // Attach took ownership
+            }
         }
         return true;
     }
@@ -1050,9 +1066,152 @@ namespace renderkit {
             return false;
         }
 
-        // @todo Record all state we change and re-set it to what it was
+        //-----------------------------------------------------------------
+        // Record all state we change and re-set it to what it was
         // originally so we don't mess with client rendering.
+        // We make use of the util::finally() lambda function to put
+        // things back no matter how we exit this function, whether at
+        // the end or in an error return partway through.
 
+        // @todo Several of the get/set sections below get all of the
+        // possible states and reset all of the possible states, when
+        // in fact we know that we are only changing a fixed number of
+        // them.  We may be able to make this slightly faster by only
+        // reading and restoring the ones we know we are going to set.
+        // For now, leaving this general so it will work even if we
+        // use more resources in the future.
+
+        D3D11_VIEWPORT viewPorts[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        m_D3D11Context->RSGetViewports(&numViewports, viewPorts);
+        auto resetViewports = util::finally([&]{
+          if (numViewports > 0) { m_D3D11Context->RSSetViewports(numViewports, viewPorts); }
+        });
+
+        D3D11_PRIMITIVE_TOPOLOGY topology;
+        m_D3D11Context->IAGetPrimitiveTopology(&topology);
+        auto resetTopology = util::finally([&]{
+          m_D3D11Context->IASetPrimitiveTopology(topology);
+        });
+
+        ID3D11InputLayout *inputLayout;
+        m_D3D11Context->IAGetInputLayout(&inputLayout);
+        auto resetLayout = util::finally([&]{
+          m_D3D11Context->IASetInputLayout(inputLayout);
+          if (inputLayout) inputLayout->Release();
+        });
+
+        ID3D11VertexShader *vertexShader;
+        ID3D11ClassInstance *vertexShaderClassInstances[256];
+        UINT vertexShaderNumInstances = 256;
+        m_D3D11Context->VSGetShader(&vertexShader,
+          vertexShaderClassInstances, &vertexShaderNumInstances);
+        auto resetVertexShader = util::finally([&]{
+          m_D3D11Context->VSSetShader(vertexShader,
+            vertexShaderClassInstances, vertexShaderNumInstances);
+          if (vertexShader) {
+            vertexShader->Release();
+          }
+          for (size_t i = 0; i < vertexShaderNumInstances; i++) {
+            vertexShaderClassInstances[i]->Release();
+          }
+        });
+
+        ID3D11PixelShader *pixelShader;
+        ID3D11ClassInstance *pixelShaderClassInstances[256];
+        UINT pixelShaderNumInstances = 256;
+        m_D3D11Context->PSGetShader(&pixelShader,
+          pixelShaderClassInstances, &pixelShaderNumInstances);
+        auto resetPixelShader = util::finally([&]{
+          m_D3D11Context->PSSetShader(pixelShader,
+            pixelShaderClassInstances, pixelShaderNumInstances);
+          if (pixelShader) {
+            pixelShader->Release();
+          }
+          for (size_t i = 0; i < pixelShaderNumInstances; i++) {
+            pixelShaderClassInstances[i]->Release();
+          }
+        });
+
+        ID3D11Buffer *constantBuffers[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT];
+        UINT constantCount = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+        m_D3D11Context->VSGetConstantBuffers(0,
+          D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
+          constantBuffers);
+        auto resetConstantBuffers = util::finally([&]{
+          m_D3D11Context->VSSetConstantBuffers(0,
+            D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT,
+            constantBuffers);
+          for (size_t i = 0; i < constantCount; i++) {
+            if (constantBuffers[i]) { constantBuffers[i]->Release(); }
+          }
+        });
+
+        ID3D11Buffer *vertexBuffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+        UINT vertexBufferCount = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+        UINT vertexStrides[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+        UINT vertexOffsets[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+        m_D3D11Context->IAGetVertexBuffers(0, vertexBufferCount, vertexBuffers,
+          vertexStrides, vertexOffsets);
+        auto resetVertexBuffers = util::finally([&]{
+          m_D3D11Context->IASetVertexBuffers(0, vertexBufferCount,
+            vertexBuffers, vertexStrides, vertexOffsets);
+          for (size_t i = 0; i < vertexBufferCount; i++) {
+            if (vertexBuffers[i]) { vertexBuffers[i]->Release(); }
+          }
+        });
+
+        ID3D11Buffer *indexBuffer;
+        DXGI_FORMAT indexFormat;
+        UINT indexOffset;
+        m_D3D11Context->IAGetIndexBuffer(&indexBuffer, &indexFormat,
+          &indexOffset);
+        auto resetIndexBuffer = util::finally([&]{
+          if (indexBuffer) { indexBuffer->Release(); }
+        });
+
+        ID3D11ShaderResourceView *shaderResources[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+        UINT shaderResourceCount = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+        m_D3D11Context->PSGetShaderResources(0,
+          D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+          shaderResources);
+        auto resetShaderResource = util::finally([&]{
+          m_D3D11Context->PSSetShaderResources(0,
+            D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,
+            shaderResources);
+          for (size_t i = 0; i < shaderResourceCount; i++) {
+            if (shaderResources[i]) { shaderResources[i]->Release(); }
+          }
+        });
+
+        ID3D11RasterizerState *state;
+        m_D3D11Context->RSGetState(&state);
+        auto resetRasterizerState = util::finally([&]{
+          m_D3D11Context->RSSetState(state);
+          if (state) { state->Release(); }
+        });
+
+        ID3D11SamplerState *samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+        UINT numSamplers = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
+        m_D3D11Context->PSGetSamplers(0, numSamplers, samplers);
+        auto resetSamplers = util::finally([&]{
+          m_D3D11Context->PSSetSamplers(0, numSamplers, samplers);
+          for (size_t i = 0; i < numSamplers; i++) {
+            if (samplers[i]) { samplers[i]->Release(); }
+          }
+        });
+
+        ID3D11DepthStencilState *depthStencilState;
+        UINT depthStencilRef;
+        m_D3D11Context->OMGetDepthStencilState(&depthStencilState,
+          &depthStencilRef);
+        auto resetDepthState = util::finally([&]{
+          m_D3D11Context->OMSetDepthStencilState(depthStencilState,
+            depthStencilRef);
+          if (depthStencilState) { depthStencilState->Release(); }
+        });
+
+        //-----------------------------------------------------------------
         // Get the viewport.  This returns a viewport for OpenGL.  To get one
         // for D3D in the case that we have a display that is rotated by 90 or
         // 270, we need to swap the eyes compared to what we've been asked for.
@@ -1160,20 +1319,59 @@ namespace renderkit {
             0, 1, m_cbPerObjectBuffer.GetAddressOf());
 
         //====================================================================
+        // Which distortion mesh to use
+        auto const & meshBuffer = m_distortionMeshBuffer[params.m_index];
+
+        //====================================================================
         // Set vertex buffer
         UINT stride = sizeof(DistortionVertex);
         UINT offset = 0;
+        ID3D11Buffer * vertexBuffer[1] = { meshBuffer.vertexBuffer.Get() };
         m_D3D11Context->IASetVertexBuffers(
-            0, 1, &m_quadVertexBuffer[params.m_index], &stride, &offset);
+            0, 1, vertexBuffer, &stride, &offset);
+
+        //====================================================================
+        // Set index buffer
+        m_D3D11Context->IASetIndexBuffer(meshBuffer.indexBuffer.Get(),
+            DXGI_FORMAT_R16_UINT, 0);
 
         //====================================================================
         // Create the shader resource view.
+        // @todo this code needs to move into the registration code rather than PresentEye
+        D3D11_TEXTURE2D_DESC colorBufferDesc = { 0 };
+        params.m_buffer.D3D11->colorBuffer->GetDesc(&colorBufferDesc);
+        DXGI_FORMAT shaderResourceViewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        switch (colorBufferDesc.Format) {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            shaderResourceViewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+            break;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            shaderResourceViewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            shaderResourceViewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+            shaderResourceViewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+            break;
+        default:
+            // @todo re-enable this log when this code is moved to registration (and use the logger API that hasn't been merged yet)
+            //if (m_log) m_log->error() << "osvr::renderkit::RenderManagerD3D11Base::PresentEye - unknown render target texture format. Defaulting to DXGI_FORMAT_R8G8B8A8_UNORM.";
+            shaderResourceViewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+        }
+
+        // We need to set things here, presumably the DXGI format, to
+        // make things render correctly when working with Unity or
+        // Unreal.  When this was taken out, we got black screens on
+        // both of them, even though the demo apps worked.
         D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
-        shaderResourceViewDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        shaderResourceViewDesc.Format = shaderResourceViewFormat;
         shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         shaderResourceViewDesc.Texture2D.MostDetailedMip = 0;
         shaderResourceViewDesc.Texture2D.MipLevels = 1;
-
+        // We pass a nullptr to the description, resulting in a view that
+        // can access the entire resource.
         ID3D11ShaderResourceView* renderTextureResourceView;
         hr = m_D3D11device->CreateShaderResourceView(
             params.m_buffer.D3D11->colorBuffer, &shaderResourceViewDesc,
@@ -1186,8 +1384,11 @@ namespace renderkit {
         }
         m_D3D11Context->PSSetShaderResources(0, 1, &renderTextureResourceView);
 
-        // @todo Record the state and re-set it to what it was originally so
-        // we don't mess with client rendering.
+        // Turn off backface culling in case user has switched the
+        // front/back which will keep our quads from being rendered.
+        m_D3D11Context->OMSetDepthStencilState(m_depthStencilStateForPresent,
+          1);
+
         // Turn off back-face culling, so we render the mesh from either side.
         m_D3D11Context->RSSetState(m_rasterizerState.Get());
 
@@ -1200,7 +1401,7 @@ namespace renderkit {
         typedef ID3D11SamplerState *SamplerConstPtr;
         SamplerConstPtr states[] {m_renderTextureSamplerState.Get()};
         m_D3D11Context->PSSetSamplers(0, 1, states);
-        m_D3D11Context->Draw(m_quadVertexCount[params.m_index], 0);
+        m_D3D11Context->DrawIndexed((UINT)meshBuffer.indices.size(), 0, 0);
 
         // Clean up after ourselves.
         renderTextureResourceView->Release();

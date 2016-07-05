@@ -418,6 +418,10 @@ namespace osvr {
             bool PresentDisplayFinalize(size_t display) override { return true; }
             bool PresentFrameFinalize() override { return true; }
 
+            bool SolidColorEye(size_t eye, const RGBColorf &color) override {
+              return mRenderManager->SolidColorEye(eye, color);
+            }
+
             //===================================================================
             // The distortion mesh is applied after time warp, so needs to be
             // passed on down to the harnessed RenderManager to handle it.
@@ -593,19 +597,6 @@ namespace osvr {
 
                     // We can't use the render thread's ID3D11RenderTargetView. Create one from
                     // the ATW's ID3D11Texture2D handle.
-
-                    // Find out the format of the texture by looking at its info.
-                    D3D11_TEXTURE2D_DESC info;
-                    texture2D->GetDesc(&info);
-
-                    // Fill in the resource view for your render texture buffer here
-                    D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc;
-                    memset(&renderTargetViewDesc, 0, sizeof(renderTargetViewDesc));
-                    // This must match what was created in the texture to be rendered
-                    renderTargetViewDesc.Format = info.Format;
-                    renderTargetViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-                    renderTargetViewDesc.Texture2D.MipSlice = 0;
-
                     newInfo.atwBuffer.D3D11 = new osvr::renderkit::RenderBufferD3D11();
                     newInfo.atwBuffer.D3D11->colorBuffer = texture2D;
 

@@ -1,10 +1,10 @@
 /** @file
-@brief Source file implementing nVidia-based OSVR direct-to-device rendering
-interface
+@brief Source file implementing D3D rendering to a window.
 
 @date 2015
 
 @author
+Russ Taylor <russ@sensics.com>
 Sensics, Inc.
 <http://sensics.com/osvr>
 */
@@ -25,6 +25,7 @@ Sensics, Inc.
 
 #include "RenderManagerD3D.h"
 #include "GraphicsLibraryD3D11.h"
+#include "RenderManagerSDLInitQuit.h"
 #include <iostream>
 #include "SDL_syswm.h"
 #include <d3d11.h>
@@ -36,7 +37,7 @@ namespace renderkit {
     RenderManagerD3D11::RenderManagerD3D11(
         OSVR_ClientContext context,
         ConstructorParameters p)
-        : RenderManagerD3D11Base(context, p) {}
+        : RenderManagerD3D11Base(context, p) { }
 
     RenderManagerD3D11::~RenderManagerD3D11() {
         for (size_t i = 0; i < m_displays.size(); i++) {
@@ -48,7 +49,6 @@ namespace renderkit {
             /// @todo Clean up anything else we need to
             m_displayOpen = false;
         }
-        SDL_Quit();
     }
 
     RenderManager::OpenResults RenderManagerD3D11::OpenDisplay(void) {
@@ -75,9 +75,10 @@ namespace renderkit {
         // Use SDL to get us a window.
 
         // Initialize the SDL video subsystem.
-        if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
-            if (m_log) m_log->error() << "RenderManagerD3D11::openD3D11Context: Could not "
-                         "initialize SDL";
+        if (!SDLInitQuit()) {
+            if (m_log) m_log->error() <<
+	              "RenderManagerD3D11::openD3D11Context: Could not "
+                      "initialize SDL";
             /// @todo should this be return withFailure() ?
             return ret;
         }
@@ -114,9 +115,8 @@ namespace renderkit {
         // pAdapter earlier)
         auto dxgiFactory = getDXGIFactory();
         if (!dxgiFactory) {
-            std::cerr
-                << "RenderManagerD3D11::OpenDisplay: Could not get dxgiFactory"
-                << std::endl;
+          if (m_log) m_log->error()
+                << "RenderManagerD3D11::OpenDisplay: Could not get dxgiFactory";
             return withFailure();
         }
 
@@ -141,9 +141,9 @@ namespace renderkit {
                 windowTitle.c_str(), windowX, m_params.m_windowYPosition,
                 widthRotated, heightRotated, flags);
             if (m_displays[display].m_window == nullptr) {
-                std::cerr
+                if (m_log) m_log->error()
                     << "RenderManagerD3D11::OpenDisplay: Could not get window "
-                    << "for display " << display << std::endl;
+                    << "for display " << display;
                 return withFailure();
             }
             SDL_SysWMinfo wmInfo;
@@ -237,19 +237,8 @@ namespace renderkit {
 
         // We want to render to the on-screen display now.  The user will have
         // switched this to their views.
-        // Do not need to clear depth/stencil for final display because we
-        // set the mode to always overwrite.
-        // @todo Put back the original one in PresentDisplayFinalize.
         m_D3D11Context->OMSetRenderTargets(
             1, &m_displays[display].m_renderTargetView, nullptr);
-        m_D3D11Context->OMSetDepthStencilState(m_depthStencilStateForPresent,
-                                               1);
-
-        // @todo Turn off backface culling in case user has switched the
-        // front/back which will keep our quads from being rendered.
-
-        // @todo Save and restore (in Finalize) the current rendering state
-        // so we don't clobber end-user settings here.
 
         return true;
     }
@@ -269,6 +258,7 @@ namespace renderkit {
             vblanks = 1;
         }
         m_displays[display].m_swapChain->Present(vblanks, 0);
+
         return true;
     }
 
@@ -286,6 +276,17 @@ namespace renderkit {
         }
 
         return true;
+    }
+
+    bool RenderManagerD3D11::SolidColorEye(
+        size_t eye, const RGBColorf &color) {
+      FLOAT colorRGBA[4] = { color.r, color.g, color.b, 1 };
+      size_t d = GetDisplayUsedByEye(eye);
+      m_D3D11Context->ClearRenderTargetView(
+        m_displays[d].m_renderTargetView,
+        colorRGBA);
+
+      return true;
     }
 
 } // namespace renderkit

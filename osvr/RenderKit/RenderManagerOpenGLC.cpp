@@ -27,6 +27,7 @@
 #include <osvr/RenderKit/RenderManager.h>
 #include <osvr/RenderKit/RenderManagerImpl.h>
 #include <osvr/RenderKit/RenderManagerOpenGL.h>
+#include <osvr/RenderKit/GraphicsLibraryOpenGL.h>
 
 // Library/third-party includes
 // - none
@@ -41,41 +42,39 @@ ConvertGraphicsLibrary(const OSVR_GraphicsLibraryOpenGL& graphicsLibrary,
   // place to put them.  Otherwise, we leave the device with its
   // default NULL pointer so that it will not think the contents
   // are valid.
-  //if (graphicsLibrary.device != nullptr ||
-  //    graphicsLibrary.context != nullptr) {
-    // osvr::renderkit::GraphicsLibraryOpenGL *glogl = new
-    // osvr::renderkit::GraphicsLibraryOpenGL();
-    // graphicsLibraryOut.OpenGL = glogl;
-  //}
+  if (graphicsLibrary.toolkit != nullptr) {
+    osvr::renderkit::GraphicsLibraryOpenGL *glogl = new
+      osvr::renderkit::GraphicsLibraryOpenGL();
+    glogl->toolkit = graphicsLibrary.toolkit;
+    graphicsLibraryOut.OpenGL = glogl;
+  }
 }
 
 inline void
 ConvertGraphicsLibrary(const osvr::renderkit::GraphicsLibrary& graphicsLibrary,
                        OSVR_GraphicsLibraryOpenGL& graphicsLibraryOut) {
     if (graphicsLibrary.OpenGL) {
-        // intentionally left blank
+      graphicsLibraryOut.toolkit = graphicsLibrary.OpenGL->toolkit;
     }
 }
 
 inline void
 ConvertRenderBuffer(const OSVR_RenderBufferOpenGL& renderBuffer,
                     osvr::renderkit::RenderBuffer& renderBufferOut) {
-    // @todo support OpenGL here.
-    // renderBufferOut.OpenGL = new osvr::renderkit::RenderBufferOpenGL();
-    // renderBufferOut.OpenGL->colorBufferName = renderBuffer.colorBufferName;
-    // renderBufferOut.OpenGL->depthStencilBufferName =
-    // renderBuffer.depthStencilBufferName;
+     renderBufferOut.OpenGL = new osvr::renderkit::RenderBufferOpenGL();
+     renderBufferOut.OpenGL->colorBufferName = renderBuffer.colorBufferName;
+     renderBufferOut.OpenGL->depthStencilBufferName =
+     renderBuffer.depthStencilBufferName;
 }
 
 inline void
 ConvertRenderBuffer(const osvr::renderkit::RenderBuffer& renderBuffer,
                     OSVR_RenderBufferOpenGL& renderBufferOut) {
-    // @todo support OpenGL here
     if (renderBuffer.OpenGL) {
-        // renderBufferOut.colorBufferName =
-        // renderBuffer.OpenGL->colorBufferName;
-        // renderBufferOut.depthStencilBufferName =
-        // renderBuffer.OpenGL->depthStencilBufferName;
+         renderBufferOut.colorBufferName =
+         renderBuffer.OpenGL->colorBufferName;
+         renderBufferOut.depthStencilBufferName =
+         renderBuffer.OpenGL->depthStencilBufferName;
     }
 }
 
@@ -131,4 +130,12 @@ OSVR_ReturnCode osvrRenderManagerRegisterRenderBufferOpenGL(
     OSVR_RenderBufferOpenGL renderBuffer) {
     return osvrRenderManagerRegisterRenderBufferImpl(registerBufferState,
                                                      renderBuffer);
+}
+
+OSVR_ReturnCode osvrRenderManagerGetRenderInfoFromCollectionOpenGL(
+    OSVR_RenderInfoCollection renderInfoCollection,
+    OSVR_RenderInfoCount index,
+    OSVR_RenderInfoOpenGL* renderInfoOut) {
+    return osvrRenderManagerGetRenderInfoFromCollectionImpl(
+        renderInfoCollection, index, renderInfoOut);
 }

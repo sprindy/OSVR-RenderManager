@@ -25,6 +25,9 @@ Russ Taylor <russ@sensics.com>
 // Internal Includes
 #include "RenderManager.h"
 #include <RenderManagerBackends.h>
+#include "DistortionCorrectTextureCoordinate.h"
+#include "DistortionParameters.h"
+#include "UnstructuredMeshInterpolator.h"
 
 #ifdef RM_USE_D3D11
 #include "RenderManagerD3D.h"
@@ -45,6 +48,7 @@ Russ Taylor <russ@sensics.com>
 
 #ifdef RM_USE_OPENGL
 #include "RenderManagerOpenGL.h"
+#include "GraphicsLibraryOpenGL.h"
 #endif
 
 #include "VendorIdTools.h"
@@ -71,7 +75,6 @@ Russ Taylor <russ@sensics.com>
 // Standard includes
 #include <chrono>
 #include <thread>
-#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <exception>
@@ -258,17 +261,12 @@ namespace renderkit {
         OSVR_ClientContext context,
         const ConstructorParameters& p) {
 
-        /// So far, so good...
-        m_doingOkay = true;
-
         /// Construct my logger
         m_log = osvr::util::log::make_logger("RenderManager");
         if (m_log == nullptr) {
           std::cerr << "RenderManager::RenderManager(): Could not construct logger."
-            << " No further logging will occur." << std::endl;
-          m_doingOkay = false;
+            " No further logging will occur." << std::endl;
         }
-        if (m_log) m_log->info("RenderManager constructed");
 
         /// @todo Clone the passed-in context rather than creating our own, when
         // this function is added to Core.
@@ -303,10 +301,10 @@ namespace renderkit {
 
         if (osvrClientGetInterface(m_context, headSpaceName.c_str(),
                                    &m_roomFromHeadInterface) ==
-              OSVR_RETURN_FAILURE) {
+            OSVR_RETURN_FAILURE) {
             if (m_log) m_log->error() << "RenderManager::RenderManager(): Can't get interface "
                       << headSpaceName;
-            m_doingOkay = false;
+            throw std::runtime_error("Can't get head interface.");
         }
         osvrPose3SetIdentity(&m_roomFromHead);
 
@@ -322,8 +320,8 @@ namespace renderkit {
 
         // Make sure we have valid data
         if (callback == nullptr) {
-          if (m_log) m_log->error()
-              << "RenderManager::SetDisplayCallback: NULL callback handler";
+            if (m_log) m_log->error()
+                << "RenderManager::SetDisplayCallback: NULL callback handler";
             return false;
         }
 
@@ -343,7 +341,7 @@ namespace renderkit {
         // Make sure we have valid data
         if (callback == nullptr) {
             if (m_log) m_log->error() << "RenderManager::SetViewProjectionCallback: NULL "
-                << "callback handler";
+                         "callback handler";
             return false;
         }
 
@@ -383,7 +381,8 @@ namespace renderkit {
                                        &cb.m_interface) ==
                 OSVR_RETURN_FAILURE) {
                 if (m_log) m_log->error() << "RenderManager::AddRenderCallback(): Can't get "
-                             << "interface " << interfaceName;
+                             "interface "
+                          << interfaceName;
             }
         }
 
@@ -412,7 +411,7 @@ namespace renderkit {
                     if (osvrClientFreeInterface(m_context,
                                                 ci.m_interface) ==
                         OSVR_RETURN_FAILURE) {
-                      if (m_log) m_log->error()
+                        if (m_log) m_log->error()
                             << "RenderManager::RemoveRenderCallback(): Could "
                                "not free the interface for this callback.";
                         return false;
@@ -427,10 +426,6 @@ namespace renderkit {
     }
 
     RenderManager::~RenderManager() {
-        if (m_log) {
-          m_log->info("RenderManager deconstructed");
-          m_log->flush();
-        }
 
         // Unregister any remaining callback handlers for devices that
         // are set to update our transformation matrices.
@@ -928,6 +923,75 @@ namespace renderkit {
         /// @todo
 
         return true;
+    }
+
+    bool RenderManager::PresentSolidColor(
+        const RGBColorf &color) {
+      // All public methods that use internal state should be guarded
+      // by a mutex.
+      std::lock_guard<std::mutex> lock(m_mutex);
+
+      return PresentSolidColorInternal(color);
+    }
+
+    bool RenderManager::PresentSolidColorInternal(
+        const RGBColorf &color) {
+      // Make sure we're doing okay.
+      if (!doingOkay()) {
+        if (m_log) m_log->error()
+          << "RenderManager::PresentSolidColorInternal(): Display not opened.";
+        return false;
+      }
+
+      // Initialize the presentation for the whole frame.
+      if (!PresentFrameInitialize()) {
+        if (m_log) m_log->error() << "RenderManager::PresentSolidColorInternal(): "
+          "PresentFrameInitialize() failed.";
+        return false;
+      }
+
+      // Render into each display, setting up the display beforehand and
+      // finalizing it after.
+      for (size_t display = 0; display < GetNumDisplays(); display++) {
+
+        // Set up the appropriate display before setting up its eye(s).
+        if (!PresentDisplayInitialize(display)) {
+          if (m_log) m_log->error() << "RenderManager::PresentSolidColorInternal(): "
+            "PresentDisplayInitialize() failed.";
+          return false;
+        }
+
+        // Render for each eye, setting up the appropriate projection
+        // and viewport.
+        for (size_t eyeInDisplay = 0; eyeInDisplay < GetNumEyesPerDisplay();
+          eyeInDisplay++) {
+
+          // Figure out which overall eye this is.
+          size_t eye = eyeInDisplay + display * GetNumEyesPerDisplay();
+
+          if (!SolidColorEye(eye, color)) {
+            if (m_log) m_log->error() << "RenderManager::PresentSolidColorInternal(): "
+              "PresentEye failed.";
+            return false;
+          }
+        }
+
+        // We're done with this display.
+        if (!PresentDisplayFinalize(display)) {
+          if (m_log) m_log->error() << "RenderManager::PresentSolidColorInternal(): "
+            "PresentDisplayFinalize failed.";
+          return false;
+        }
+      }
+
+      // Finalize the rendering for the whole frame.
+      if (!PresentFrameFinalize()) {
+        if (m_log) m_log->error() << "RenderManager::PresentSolidColorInternal(): "
+          "PresentFrameFinalize failed.";
+        return false;
+      }
+
+      return true;
     }
 
     bool RenderManager::UpdateDistortionMeshes(
@@ -1711,7 +1775,7 @@ namespace renderkit {
 
         /// Translate so that the origin moves to the location of
         /// the lower-left corner.
-        Eigen::Affine3f translate(Eigen::Translation3f(
+        Eigen::Isometry3f translate(Eigen::Translation3f(
             static_cast<float>(normalizedCroppingViewport.left),
             static_cast<float>(normalizedCroppingViewport.lower), 0.0f));
 
@@ -1722,588 +1786,14 @@ namespace renderkit {
             static_cast<float>(normalizedCroppingViewport.height), 1.0f));
 
         /// Compute the full matrix by multiplying the parts.
-        Eigen::Projective3f full = translate * scale;
-
-        // Store the result.
-        memcpy(outMatrix.data, full.matrix().data(), sizeof(outMatrix.data));
+        Eigen::Matrix4f::Map(outMatrix.data) =
+            Eigen::Projective3f(translate * scale).matrix();
 
         return true;
     }
 
     static double pointDistance(double x1, double y1, double x2, double y2) {
         return std::sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
-    }
-
-    RenderManager::UnstructuredMeshInterpolator::UnstructuredMeshInterpolator(
-        const MonoPointDistortionMeshDescription& points,
-        int numSamplesX, int numSamplesY
-        ) : m_points(points), m_numSamplesX(numSamplesX),
-        m_numSamplesY(numSamplesY) {
-
-      // Construct and fill in the grid of nearby points that is used by the
-      // interpolation function to accelerate the search for the three
-      // nearest non-collinear points.
-      std::vector< MonoPointDistortionMeshDescription> ySet;
-      MonoPointDistortionMeshDescription empty;
-      for (size_t y = 0; y < m_numSamplesY; y++) {
-        ySet.emplace_back(empty);
-      }
-      for (size_t x = 0; x < m_numSamplesX; x++) {
-        m_grid.emplace_back(ySet);
-      }
-      
-      // Go through each point in the unstructured grid and insert its index
-      // into all grid elements that are within 1/4th (rounded up) of the
-      // total span of the grid from its normalized location.
-      int xHalfSpan = static_cast<int>(0.9 + (1.0/4.0)*0.5 * m_numSamplesX);
-      int yHalfSpan = static_cast<int>(0.9 + (1.0/4.0)*0.5 * m_numSamplesY);
-      for (size_t i = 0; i < points.size(); i++) {
-        int xIndex, yIndex;
-        if (getIndex(points[i][0][0], points[i][0][1], xIndex, yIndex)) {
-
-          // Get the range of locations to insert
-          int xMin = xIndex - xHalfSpan;
-          if (xMin < 0) { xMin = 0; }
-          int xMax = xIndex + xHalfSpan;
-          if (xMax >= m_numSamplesX) { xMax = m_numSamplesX - 1; }
-          int yMin = yIndex - yHalfSpan;
-          if (yMin < 0) { yMin = 0; }
-          int yMax = yIndex + yHalfSpan;
-          if (yMax >= m_numSamplesY) { yMax = m_numSamplesY - 1; }
-
-          // Insert this point into each of these locations.
-          for (int x = xMin; x <= xMax; x++) {
-            for (int y = yMin; y <= yMax; y++) {
-              m_grid[x][y].push_back(points[i]);
-            }
-          }
-        }
-      }
-    }
-
-    Float2
-    RenderManager::UnstructuredMeshInterpolator::interpolateNearestPoints(
-            float xN, float yN) {
-        Float2 ret = {};
-
-        // Look in the spatial-acceleration grid to see if we can
-        // find three points without having to search the entire set of
-        // points.
-        int xIndex, yIndex;
-        if (!getIndex(xN, yN, xIndex, yIndex)) {
-          return ret;
-        }
-        MonoPointDistortionMeshDescription points;
-        points = getNearestPoints(xN, yN, m_grid[xIndex][yIndex]);
-
-        // If we didn't get enough points from the acceleration
-        // structure, look in the whole points array
-        if (points.size() < 3) {
-          points = getNearestPoints(xN, yN, m_points);
-        }
-
-        // If we didn't get three points, just return the output of
-        // the first point we found.
-
-        if (points.size() < 3) {
-          float xNew = static_cast<float>(points[0][1][0]);
-          float yNew = static_cast<float>(points[0][1][1]);
-          ret[0] = xNew;
-          ret[1] = yNew;
-          return ret;
-        }
-
-        // Found three points -- interpolate them.
-        float xNew = static_cast<float>(interpolate(
-          points[0][0][0], points[0][0][1], points[0][1][0],
-          points[1][0][0], points[1][0][1], points[1][1][0],
-          points[2][0][0], points[2][0][1], points[2][1][0], xN,
-          yN));
-        float yNew = static_cast<float>(interpolate(
-          points[0][0][0], points[0][0][1], points[0][1][1],
-          points[1][0][0], points[1][0][1], points[1][1][1],
-          points[2][0][0], points[2][0][1], points[2][1][1], xN,
-          yN));
-        ret[0] = xNew;
-        ret[1] = yNew;
-        return ret;
-    }
-
-    MonoPointDistortionMeshDescription
-      RenderManager::UnstructuredMeshInterpolator::getNearestPoints(
-          float xN, float yN,
-          const MonoPointDistortionMeshDescription &points) {
-
-      MonoPointDistortionMeshDescription ret;
-
-      // Find the three non-collinear points in the mesh that are nearest
-      // to the normalized point we are trying to look up.  We start by
-      // sorting the points based on distance from our location, selecting
-      // the first two, and then looking through the rest until we find
-      // one that is not collinear with the first two (normalized dot
-      // product magnitude far enough from 1).  If we don't find such
-      // points, we just go with the values from the closest point.
-      typedef std::multimap<double, size_t> PointDistanceIndexMap;
-      PointDistanceIndexMap map;
-      for (size_t i = 0; i < points.size(); i++) {
-        // Insertion into the multimap sorts them by distance.
-        map.insert(std::make_pair(
-          pointDistance(xN, yN, points[i][0][0], points[i][0][1]), i));
-      }
-
-      PointDistanceIndexMap::const_iterator it = map.begin();
-      size_t first = it->second;
-      it++;
-      size_t second = it->second;
-      it++;
-      size_t third = first;
-      while (it != map.end()) {
-        if (!nearly_collinear(points[first][0], points[second][0],
-          points[it->second][0])) {
-          third = it->second;
-          break;
-        }
-        it++;
-      }
-
-      // Push back all of the points we found, which may not include
-      // a third point if the first is the same as the third.
-      if (map.size() >= 1) { ret.push_back(points[first]); }
-      if (map.size() >= 2) { ret.push_back(points[second]); }
-      if (third != first) {
-        ret.push_back(points[third]);
-      }
-      return ret;
-    }
-
-    Float2 RenderManager::DistortionCorrectTextureCoordinate(
-        size_t eye //< Which eye?
-        , Float2 const& inCoords //< Coordinates to modify
-        , DistortionParameters distort //< Distortion parameters
-        , size_t color //< 0 = red, 1 = green, 2 = blue
-        ) {
-        Float2 ret = inCoords;
-
-        // Check for invalid parameters
-        if (color > 2) {
-            return ret;
-        }
-        using Eigen::Vector2f;
-        // Convert from coordinates in the overfilled texture to coordinates
-        // that will cover the range (0,0) to (1,1) on the screen.  This is
-        // done by scaling around (0.5,0.5) to push the edges of the screen
-        // out to the (0,0) and (1,1) boundaries.
-        Eigen::Map<Vector2f> retMap(ret.data());
-        Eigen::Map<const Vector2f> inMap(inCoords.data());
-
-        Vector2f xyN = (inMap - Vector2f::Constant(0.5f)) *
-                           m_params.m_renderOverfillFactor +
-                       Vector2f::Constant(0.5f);
-        /// these are for mono point that hasn't been ported to eigen yet.
-        float x = inCoords[0];
-        float y = inCoords[1];
-        float xN = xyN.x();
-        float yN = xyN.y();
-
-        switch (distort.m_type) {
-        case osvr::renderkit::RenderManager::DistortionParameters::
-            rgb_symmetric_polynomials: {
-            if (distort.m_distortionPolynomialRed.size() < 2) {
-                return ret;
-            }
-            if (distort.m_distortionPolynomialGreen.size() < 2) {
-                return ret;
-            }
-            if (distort.m_distortionPolynomialBlue.size() < 2) {
-                return ret;
-            }
-            if (distort.m_distortionCOP.size() != 2) {
-                return ret;
-            }
-            if (distort.m_distortionD.size() != 2) {
-                return ret;
-            }
-            if (distort.m_distortionD[0] <= 0) {
-                return ret;
-            }
-            if (distort.m_distortionD[1] <= 0) {
-                return ret;
-            }
-
-            // Convert from normalized range to (D[0], D[1]) range.  Here,
-            // both coordinate systems share a common (0,0) boundary so we
-            // can just scale around the origin.
-            Vector2f xyD =
-                xyN.cwiseProduct(Vector2f::Map(distort.m_distortionD.data()));
-
-            // Compute the distance from the COP in D space
-            // (direction and squared magnitude)
-            Vector2f xyDDiff =
-                xyD - Vector2f::Map(distort.m_distortionCOP.data());
-            float rMag2 = xyDDiff.squaredNorm();
-            if (rMag2 == 0) { // We're at the center -- no distortion
-                ret = inCoords;
-                return ret;
-            }
-            float rMag = sqrt(rMag2);
-            Vector2f xyDNorm = xyDDiff / rMag;
-
-            // Compute the new location in D space based on the distortion
-            // parameters
-            std::vector<float> const& params =
-                color == 0 ? distort.m_distortionPolynomialRed
-                           : color == 1 ? distort.m_distortionPolynomialGreen
-                                        : distort.m_distortionPolynomialBlue;
-
-            // The distance scaling factor needs to be applied as many times
-            // as the degree of the polynomial we are using.  For the constant
-            // term, the factor is 1.
-            float rFactor = 1;
-            float rNew = params[0];
-
-            auto n = params.size();
-            using index_type = decltype(n);
-            for (index_type i = 1; i < n; i++) {
-                rFactor *= rMag;
-                rNew += params[i] * rFactor;
-            }
-            Vector2f xyDNew =
-                Vector2f::Map(distort.m_distortionCOP.data()) + rNew * xyDNorm;
-
-            // Convert from D space back to unit space
-            Vector2f xyNNew = xyDNew.cwiseQuotient(
-                Vector2f::Map(distort.m_distortionD.data()));
-
-            Vector2f::Map(ret.data()) = xyNNew;
-        } break;
-        case osvr::renderkit::RenderManager::DistortionParameters::
-            mono_point_samples: {
-            if (eye >= distort.m_monoPointSamples.size()) {
-                return ret;
-            }
-
-            MonoPointDistortionMeshDescription& points =
-                distort.m_monoPointSamples[eye];
-            if (points.size() < 3) {
-                return ret;
-            }
-
-            // Find the three non-collinear points in the mesh that are nearest
-            // to the normalized point we are trying to look up.  We start by
-            // sorting the points based on distance from our location, selecting
-            // the first two, and then looking through the rest until we find
-            // one that is not collinear with the first two (normalized dot
-            // product magnitude far enough from 1).  If we don't find such
-            // points, we just go with the values from the closest point.
-            ret = m_interpolators[0]->interpolateNearestPoints(xN, yN);
-        } break;
-        case osvr::renderkit::RenderManager::DistortionParameters::
-            rgb_point_samples: {
-            if (color >= 3) {
-                return ret;
-            }
-            if (eye >= distort.m_rgbPointSamples[color].size()) {
-                return ret;
-            }
-
-            MonoPointDistortionMeshDescription& points =
-                distort.m_rgbPointSamples[color][eye];
-            if (points.size() < 3) {
-                return ret;
-            }
-
-            // Find the three non-collinear points in the mesh that are nearest
-            // to the normalized point we are trying to look up.  We start by
-            // sorting the points based on distance from our location, selecting
-            // the first two, and then looking through the rest until we find
-            // one that is not collinear with the first two (normalized dot
-            // product magnitude far enough from 1).  If we don't find such
-            // points, we just go with the values from the closest point.
-            ret = m_interpolators[color]->interpolateNearestPoints(xN, yN);
-        } break;
-        default:
-            break;
-        }
-
-        // Convert from unit (normalized) space back into overfill space.
-        ret[0] = (ret[0] - 0.5f) / m_params.m_renderOverfillFactor + 0.5f;
-        ret[1] = (ret[1] - 0.5f) / m_params.m_renderOverfillFactor + 0.5f;
-
-        return ret;
-    }
-
-    std::vector<RenderManager::DistortionMeshVertex>
-    RenderManager::ComputeDistortionMesh(
-        size_t eye //< Which eye?
-        , DistortionMeshType type //< Type of mesh to produce
-        , DistortionParameters distort //< Distortion parameters
-        ) {
-        std::vector<RenderManager::DistortionMeshVertex> ret;
-
-        // Clear any created interpolators, freeing up their memory
-        // first.  These may have been left behind by a failed
-        // mesh-creation from before.
-        for (size_t clr = 0; clr < m_interpolators.size(); clr++) {
-            delete m_interpolators[clr];
-        }
-        m_interpolators.clear();
-
-        // Check the validity of the parameters, based on the ones we're
-        // using.
-        if (distort.m_type ==
-            RenderManager::DistortionParameters::rgb_symmetric_polynomials) {
-            if (distort.m_distortionPolynomialRed.size() < 2) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2+ "
-                             "red polynomial coefficients, found "
-                          << distort.m_distortionPolynomialRed.size();
-                return ret;
-            }
-            if (distort.m_distortionPolynomialGreen.size() < 2) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2+ "
-                             "green polynomial coefficients, found "
-                          << distort.m_distortionPolynomialGreen.size();
-                return ret;
-            }
-            if (distort.m_distortionPolynomialBlue.size() < 2) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2+ "
-                             "blue polynomial coefficients, found "
-                          << distort.m_distortionPolynomialBlue.size();
-                return ret;
-            }
-            if (distort.m_distortionD.size() != 2) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2 "
-                             "distortion coefficients, found "
-                          << distort.m_distortionD.size();
-                return ret;
-            }
-        } else if (distort.m_type ==
-                   RenderManager::DistortionParameters::mono_point_samples) {
-            if (distort.m_monoPointSamples.size() != 2) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2 "
-                             "meshes, found "
-                          << distort.m_monoPointSamples.size();
-                return ret;
-            }
-            // Add a new interpolator to be used when we're finding
-            // mesh coordinates.
-            if (distort.m_monoPointSamples[eye].size() < 3) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need "
-                              "3+ points, found "
-                          << distort.m_monoPointSamples[eye].size();
-                return ret;
-            }
-            for (size_t i = 0; i < distort.m_monoPointSamples[eye].size();
-                  i++) {
-                if (distort.m_monoPointSamples[eye][i].size() != 2) {
-                    if (m_log) m_log->error()
-                        << "RenderManager::ComputeDistortionMesh: Need 2 "
-                        << "points in the mesh, found "
-                        << distort.m_monoPointSamples[eye][i].size();
-                    return ret;
-                }
-                if (distort.m_monoPointSamples[eye][i][0].size() != 2) {
-                    if (m_log) m_log->error()
-                        << "RenderManager::ComputeDistortionMesh: Need 2 "
-                        << "values in input point, found "
-                        << distort.m_monoPointSamples[eye][i][0].size();
-                    return ret;
-                }
-                if (distort.m_monoPointSamples[eye][i][1].size() != 2) {
-                    if (m_log) m_log->error()
-                        << "RenderManager::ComputeDistortionMesh: Need 2 "
-                        << "values in output point, found "
-                        << distort.m_monoPointSamples[eye][i][1].size();
-                    return ret;
-                }
-            }
-            // Add a new interpolator to be used when we're finding
-            // mesh coordinates.
-            m_interpolators.emplace_back(new
-              UnstructuredMeshInterpolator(distort.m_monoPointSamples[eye]));
-        }
-        else if (distort.m_type ==
-                   RenderManager::DistortionParameters::rgb_point_samples) {
-            if (distort.m_rgbPointSamples.size() != 3) {
-                if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 3 "
-                             "color meshes, found "
-                          << distort.m_rgbPointSamples.size();
-                return ret;
-            }
-            for (size_t clr = 0; clr < 3; clr++) {
-                if (distort.m_rgbPointSamples[clr].size() != 2) {
-                    if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Need 2 "
-                                 "eye meshes, found "
-                              << distort.m_rgbPointSamples[clr].size();
-                    return ret;
-                }
-                // Add a new interpolator to be used when we're finding
-                // mesh coordinates.
-                if (distort.m_rgbPointSamples[clr][eye].size() < 3) {
-                    if (m_log) m_log->error()
-                        << "RenderManager::ComputeDistortionMesh: Need "
-                            "3+ points, found "
-                        << distort.m_rgbPointSamples[clr][eye].size();
-                    return ret;
-                }
-                for (size_t i = 0;
-                      i < distort.m_rgbPointSamples[clr][eye].size(); i++) {
-                    if (distort.m_rgbPointSamples[clr][eye][i].size() !=
-                        2) {
-                        if (m_log) m_log->error()
-                            << "RenderManager::ComputeDistortionMesh: Need "
-                                "2 "
-                            << "points in the mesh, found "
-                            << distort.m_rgbPointSamples[clr][eye][i].size();
-                        return ret;
-                    }
-                    if (distort.m_rgbPointSamples[clr][eye][i][0].size() !=
-                        2) {
-                        if (m_log) m_log->error()
-                            << "RenderManager::ComputeDistortionMesh: Need "
-                                "2 "
-                            << "values in input point, found "
-                            << distort.m_rgbPointSamples[clr][eye][i][0]
-                                    .size();
-                        return ret;
-                    }
-                    if (distort.m_rgbPointSamples[clr][eye][i][1].size() !=
-                        2) {
-                        if (m_log) m_log->error()
-                            << "RenderManager::ComputeDistortionMesh: Need "
-                                "2 "
-                            << "values in output point, found "
-                            << distort.m_rgbPointSamples[clr][eye][i][1]
-                                    .size();
-                        return ret;
-                    }
-                }
-
-                // Add a new interpolator to be used when we're finding
-                // mesh coordinates, one per eye.
-                m_interpolators.emplace_back(new
-                  UnstructuredMeshInterpolator(distort.m_rgbPointSamples[clr][eye]));
-            }
-        } else {
-            if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Unrecognized "
-                      << "distortion parameter type";
-            return ret;
-        }
-
-        // See what kind of mesh we're supposed to produce.  Make the
-        // appropriate one.
-        switch (type) {
-        case SQUARE: {
-            // Figure out how many quads we should use in each dimension.  The
-            // minimum is 1.  We have an even number in each.  There are two
-            // triangles per quad.
-            int quadsPerSide =
-                static_cast<int>(sqrt(distort.m_desiredTriangles / 2));
-            if (quadsPerSide < 1) {
-                quadsPerSide = 1;
-            }
-
-            // Figure out how large each quad will be.  Recall that we're
-            // covering a range of 2 (from -1 to 1) in each dimension, so the
-            // quads will all be square in texture space.
-            float quadSide = 2.0f / quadsPerSide;
-            float quadTexSide = 1.0f / quadsPerSide;
-
-            // Generate a pair of triangles for each quad, wound
-            // counter-clockwise, with appropriate spatial location and texture
-            // coordinates.
-            // Compute distorted texture coordinates and use those for each
-            // vertex.
-
-            // total of quadsPerSide * quadsPerSide * 6 vertices added: reserve
-            // that space to avoid excess copying during mesh generation.
-            ret.reserve(quadsPerSide * quadsPerSide * 6);
-
-            for (int x = 0; x < quadsPerSide; x++) {
-                float xLow = -1 + x * quadSide;
-                float xHigh = -1 + (x + 1) * quadSide;
-                float xTexLow = x * quadTexSide;
-                float xTexHigh = (x + 1) * quadTexSide;
-
-                for (int y = 0; y < quadsPerSide; y++) {
-                    /// 6 vertices per inner loop
-                    float yLow = -1 + y * quadSide;
-                    float yHigh = -1 + (y + 1) * quadSide;
-                    float yTexLow = y * quadTexSide;
-                    float yTexHigh = (y + 1) * quadTexSide;
-
-                    Float2 posLL = { xLow, yLow };
-                    Float2 posLH = { xLow, yHigh };
-                    Float2 posHL = { xHigh, yLow };
-                    Float2 posHH = { xHigh, yHigh };
-
-                    Float2 texLL = {xTexLow, yTexLow};
-                    Float2 texLH = {xTexLow, yTexHigh};
-                    Float2 texHL = {xTexHigh, yTexLow};
-                    Float2 texHH = {xTexHigh, yTexHigh};
-
-                    // First triangle - emplace DistortionMeshVertex
-                    ret.emplace_back(posLL, DistortionCorrectTextureCoordinate(
-                                                eye, texLL, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLL, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLL, distort, 2));
-                    ret.emplace_back(posHL, DistortionCorrectTextureCoordinate(
-                                                eye, texHL, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHL, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHL, distort, 2));
-                    ret.emplace_back(posHH, DistortionCorrectTextureCoordinate(
-                                                eye, texHH, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHH, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHH, distort, 2));
-
-                    // Second triangle
-                    ret.emplace_back(posLL, DistortionCorrectTextureCoordinate(
-                                                eye, texLL, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLL, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLL, distort, 2));
-                    ret.emplace_back(posHH, DistortionCorrectTextureCoordinate(
-                                                eye, texHH, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHH, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texHH, distort, 2));
-                    ret.emplace_back(posLH, DistortionCorrectTextureCoordinate(
-                                                eye, texLH, distort, 0),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLH, distort, 1),
-                                     DistortionCorrectTextureCoordinate(
-                                         eye, texLH, distort, 2));
-                }
-            }
-        } break;
-        case RADIAL: {
-            if (m_log) m_log->error()
-                << "RenderManager::ComputeDistortionMesh: Radial mesh type "
-                << "not yet implemented";
-
-            // @todo Scale the aspect ratio of the rings around the center of
-            // projection so that they will be round in the visible display.
-        } break;
-        default:
-            if (m_log) m_log->error() << "RenderManager::ComputeDistortionMesh: Unsupported "
-                         "mesh type: " << type;
-        }
-
-        // Clear any created interpolators, freeing up their memory
-        // first.
-        for (size_t clr = 0; clr < m_interpolators.size(); clr++) {
-            delete m_interpolators[clr];
-        }
-        m_interpolators.clear();
-
-        return ret;
     }
 
     static std::string osvrRenderManagerGetString(OSVR_ClientContext context,
@@ -2313,7 +1803,6 @@ namespace renderkit {
             OSVR_RETURN_FAILURE) {
             std::string msg =
                 std::string("Couldn't get osvr string length for path ") + path;
-            std::cerr << msg << std::endl;
             throw std::runtime_error(msg);
         }
 
@@ -2405,8 +1894,7 @@ namespace renderkit {
   #endif
 #else
       std::cerr << "openRenderManagerDirectMode: No DirectRender libraries "
-        "compiled into RenderManager."
-        << std::endl;
+        "compiled into RenderManager." << std::endl;
 #endif
       return ret;
     }
@@ -2422,6 +1910,8 @@ namespace renderkit {
                                        GraphicsLibrary graphicsLibrary) {
         // Null pointer return in case we can't open one.
         std::unique_ptr<RenderManager> ret;
+
+        osvr::util::log::LoggerPtr m_log = osvr::util::log::make_logger("RenderManager");
 
         // Wait until we get a connection to a display object, from which we
         // will
@@ -2442,18 +1932,16 @@ namespace renderkit {
             end = std::chrono::system_clock::now();
             std::chrono::duration<double> elapsed = end - start;
             if (elapsed.count() >= 1) {
-                std::cerr << "RenderManager::createRenderManager(): Waiting to "
-                             "get Display from server..."
-                          << std::endl;
+                if (m_log) m_log->error() << "RenderManager::createRenderManager(): Waiting to "
+                             "get Display from server...";
                 start = end;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } while (displayReturnCode == OSVR_RETURN_FAILURE);
-        std::cerr << "RenderManager::createRenderManager(): Got Display info "
+        if (m_log) m_log->error() << "RenderManager::createRenderManager(): Got Display info "
                      "from server "
                      "(ignore earlier errors that occured while we were "
-                     "waiting to connect)"
-                  << std::endl;
+                     "waiting to connect)";
 
         // Check the information in the pipeline configuration to determine
         // what kind of renderer to instantiate.  Also fill in the parameters
@@ -2479,16 +1967,14 @@ namespace renderkit {
             // pipelineConfig =
             // osvr::client::RenderManagerConfigFactory::createShared(context->get());
         } catch (std::exception& /*e*/) {
-            std::cerr << "createRenderManager: Could not parse "
-                         "/render_manager_parameters string from server."
-                      << std::endl;
+            if (m_log) m_log->error() << "createRenderManager: Could not parse "
+                         "/render_manager_parameters string from server.";
             return nullptr;
         }
         if (pipelineConfig == nullptr) {
-            std::cerr << "createRenderManager: Could not parse "
+            if (m_log) m_log->error() << "createRenderManager: Could not parse "
                          "/render_manager_parameters string from server (NULL "
-                         "pipelineconfig)."
-                      << std::endl;
+                         "pipelineconfig).";
             return nullptr;
         }
         p.m_directMode = pipelineConfig->getDirectMode();
@@ -2523,9 +2009,8 @@ namespace renderkit {
                 Display_Rotation::TwoSeventy;
             break;
         default:
-            std::cerr << "createRenderManager: Unrecognized display rotation ("
-                      << rotation << ") in rendermanager config file"
-                      << std::endl;
+            if (m_log) m_log->error() << "createRenderManager: Unrecognized display rotation ("
+                      << rotation << ") in rendermanager config file";
             return nullptr;
         }
         p.m_bitsPerColor = pipelineConfig->getBitsPerColor();
@@ -2552,9 +2037,8 @@ namespace renderkit {
             OSVRDisplayConfiguration displayConfig(jsonString);
             p.m_displayConfiguration = displayConfig;
         } catch (std::exception& /*e*/) {
-            std::cerr << "createRenderManager: Could not parse /display string "
-                         "from server."
-                      << std::endl;
+            if (m_log) m_log->error() << "createRenderManager: Could not parse /display string "
+                         "from server.";
             return nullptr;
         }
 
@@ -2577,159 +2061,20 @@ namespace renderkit {
             p.addCandidatePNPID("IWR"); // 0xF226
         } else if (p.m_displayConfiguration.getVendor() == "HTC") {
           p.addCandidatePNPID("HVR"); // 0xD222
-        } else if (p.m_displayConfiguration.getVendor() == "AVR") {
-          p.addCandidatePNPID("AVR"); // 0xD206
+        } else if (p.m_displayConfiguration.getVendor() == "VRGate") {
+          p.addCandidatePNPID("VRG"); // 0x475A
+          p.addCandidatePNPID("TSB"); // 0x6252
         }
         p.m_directModeIndex = -1; // -1 means select based on resolution
 
-#if 0
-    // Construct the distortion parameters based on information from the
-    // Core display class.
-
-    /// @todo Implement multiple viewers.
-    /// Get the number of viewers.
-    OSVR_ViewerCount viewers;
-    osvrClientGetNumViewers(display, &viewers);
-    if (viewers != 1) {
-      std::cerr << "RenderManager::createRenderManager(): Multiple viewers not "
-        << "yet implemented" << std::endl;
-      return nullptr;
-    }
-    OSVR_ViewerCount viewer;
-    for (viewer = 0; viewer < viewers; ++viewer) {
-      OSVR_EyeCount eyes;
-      osvrClientGetNumEyesForViewer(display, viewer, &eyes);
-
-      /// @todo Handle multiple display surfaces per eye.
-      OSVR_SurfaceCount surfaces;
-      osvrClientGetNumSurfacesForViewerEye(display, viewer, 0 /* eye */,
-        &surfaces);
-      if (surfaces != 1) {
-        std::cerr << "RenderManager::createRenderManager(): Multiple surfaces "
-          << "per eye not yet implemented" << std::endl;
-        return nullptr;
-      }
-
-      /// Get any radial distortion parameters for each eye.
-      /// If an eye does not have them, use the default parameters
-      /// that don't do distortion and turn off the request for
-      /// distortion.
-      OSVR_EyeCount eye;
-      p.m_distortionCorrection = false;
-      for (eye = 0; eye < eyes; ++eye) {
-        OSVR_RadialDistortionParameters rDP;
-        OSVR_ReturnCode ret;
-        ret = osvrClientGetViewerEyeSurfaceRadialDistortion(display,
-          viewer, eye, 0 /*surface*/, &rDP);
-        if (ret == OSVR_RETURN_SUCCESS) {
-          // Turn on distortion correction and set the parameters for
-          // this eye.  We assume that the parameters are in the space
-          // that is the size of the display.
-          RenderManager::DistortionParameters dP;
-          dP.m_desiredTriangles = 800;
-          std::vector<float> COP;
-          COP.push_back(static_cast<float>(rDP.centerOfProjection.data[0]));
-          COP.push_back(static_cast<float>(rDP.centerOfProjection.data[1]));
-          dP.m_distortionCOP = COP;
-          std::vector<float> K1s;
-          K1s.push_back(static_cast<float>(rDP.k1.data[0]));
-          K1s.push_back(static_cast<float>(rDP.k1.data[1]));
-          K1s.push_back(static_cast<float>(rDP.k1.data[2]));
-          dP.m_distortionK1s = K1s;
-          // Scale the D's so that the K unit for width is with respect
-          // to a unity D and the K value for height is adjusted by
-          // the aspect ratio.
-          std::vector<float> Ds;
-          // @todo Fill in Ds based on display size from Core.
-          //  Get viewport from ViewerEye, getViewerEyeSurface()
-          //  Don't divide by 2 in this case, since the viewport
-          //  is sized for each eye.
-          // @todo Figure out how to handle single vs. multiple eyes
-          //   in the same display.
-          Ds.push_back(1.0f);
-          Ds.push_back(1.0f);
-          //Ds.push_back(static_cast<float>(
-          //  p.m_displayConfiguration.getDisplayWidth()/2));
-          //Ds.push_back(static_cast<float>(
-          //  p.m_displayConfiguration.getDisplayHeight()));
-          dP.m_distortionD = Ds;
-          p.m_distortionParameters.push_back(dP);
-          p.m_distortionCorrection = true;
-        } else {
-          // Push back an empty set of parameters for this eye
-          p.m_distortionParameters.push_back(RenderManager::DistortionParameters());
-        }
-      }
-    }
-
-#else
         // Construct the distortion parameters based on the local display
         // class.
         // @todo Remove once we get a general polynomial from Core.
-        RenderManager::DistortionParameters distortion;
-        distortion.m_desiredTriangles = 200 * 64;
-
-        if (p.m_displayConfiguration.getDistortionType() ==
-            OSVRDisplayConfiguration::RGB_SYMMETRIC_POLYNOMIALS) {
-            distortion.m_type = osvr::renderkit::RenderManager::
-                DistortionParameters::Type::rgb_symmetric_polynomials;
-            std::vector<float> Ds;
-            Ds.push_back(
-                p.m_displayConfiguration.getDistortionDistanceScaleX());
-            Ds.push_back(
-                p.m_displayConfiguration.getDistortionDistanceScaleY());
-            distortion.m_distortionD = Ds;
-            distortion.m_distortionPolynomialRed =
-                p.m_displayConfiguration.getDistortionPolynomalRed();
-            distortion.m_distortionPolynomialGreen =
-                p.m_displayConfiguration.getDistortionPolynomalGreen();
-            distortion.m_distortionPolynomialBlue =
-                p.m_displayConfiguration.getDistortionPolynomalBlue();
-            for (size_t i = 0; i < p.m_displayConfiguration.getEyes().size();
-                 i++) {
-                std::vector<float> COP = {
-                    static_cast<float>(
-                        p.m_displayConfiguration.getEyes()[i].m_CenterProjX),
-                    static_cast<float>(
-                        p.m_displayConfiguration.getEyes()[i].m_CenterProjY)};
-                distortion.m_distortionCOP = COP;
-                p.m_distortionParameters.push_back(distortion);
-            }
-        } else if (p.m_displayConfiguration.getDistortionType() ==
-                   OSVRDisplayConfiguration::MONO_POINT_SAMPLES) {
-            distortion.m_type = osvr::renderkit::RenderManager::
-                DistortionParameters::Type::mono_point_samples;
-            distortion.m_monoPointSamples =
-                p.m_displayConfiguration.getDistortionMonoPointMeshes();
-            // Push back the same parameter set for both eyes; the parameter has
-            // a vector that has info for each eye, and the code that uses this
-            // will select the right one.
-            // @todo Seems like it might make more sense to pull out the
-            // individual parameter sets here and push back one for each eye,
-            // rather than sending both sets in twice.
-            p.m_distortionParameters.assign(
-                p.m_displayConfiguration.getEyes().size(), distortion);
-        } else if (p.m_displayConfiguration.getDistortionType() ==
-                   OSVRDisplayConfiguration::RGB_POINT_SAMPLES) {
-            distortion.m_type = osvr::renderkit::RenderManager::
-                DistortionParameters::Type::rgb_point_samples;
-            distortion.m_rgbPointSamples =
-                p.m_displayConfiguration.getDistortionRGBPointMeshes();
-            // Push back the same parameter set for both eyes; the parameter has
-            // a vector that has info for each eye, and the code that uses this
-            // will select the right one.
-            // @todo Seems like it might make more sense to pull out the
-            // individual parameter sets here and push back one for each eye,
-            // rather than sending both sets in twice.
-            p.m_distortionParameters.assign(
-                p.m_displayConfiguration.getEyes().size(), distortion);
-        } else {
-            std::cerr << "createRenderManager: Unrecognized distortion "
-                         "correction type ("
-                      << p.m_displayConfiguration.getDistortionTypeString()
-                      << ") in display config file" << std::endl;
+        for (size_t i = 0; i < p.m_displayConfiguration.getEyes().size(); i++) {
+          DistortionParameters distortion(p.m_displayConfiguration, i);
+          distortion.m_desiredTriangles = 200 * 64;
+          p.m_distortionParameters.push_back(distortion);
         }
-#endif
 
         // @todo Read the info we need from Core.
 
@@ -2754,21 +2099,20 @@ namespace renderkit {
                 ret.reset(openRenderManagerDirectMode(contextParameter, p));
               }
               if (ret == nullptr) {
-                std::cerr << "createRenderManager: Could not open the"
-                  << " requested DirectMode display" << std::endl;
+                if (m_log) m_log->error() << "createRenderManager: Could not open the"
+                  << " requested DirectMode display";
               }
             } else {
               ret.reset(new RenderManagerD3D11(contextParameter, p));
             }
 #else
-              std::cerr << "createRenderManager: D3D11 render library "
-                "not compiled in"
-                << std::endl;
+              if (m_log) m_log->error() << "createRenderManager: D3D11 render library "
+                "not compiled in";
               return nullptr;
 #endif
         } else if (p.m_renderLibrary == "OpenGL") {
             if (p.m_directMode) {
-// nVidia DirectMode is currently only implemented under Direct3D11,
+// DirectMode is currently only implemented under Direct3D11,
 // so we wrap this with an OpenGL renderer.
 #if defined(RM_USE_NVIDIA_DIRECT_D3D11_OPENGL) && !defined(RM_USE_OPENGLES20)
                 // Set the parameters on the harnessed renderer to not apply the
@@ -2792,16 +2136,14 @@ namespace renderkit {
                      ++eye) {
                     if (p2.m_distortionParameters[eye].m_distortionCOP.size() <
                         2) {
-                        std::cerr << "createRenderManager: Insufficient "
-                                     "distortion parameters"
-                                  << std::endl;
+                        if (m_log) m_log->error() << "createRenderManager: Insufficient "
+                                     "distortion parameters";
                         return nullptr;
                     }
                     if (p2.m_distortionParameters[eye].m_distortionD.size() <
                         2) {
-                        std::cerr << "createRenderManager: Insufficient "
-                                     "distortion parameters"
-                                  << std::endl;
+                        if (m_log) m_log->error() << "createRenderManager: Insufficient "
+                                     "distortion parameters";
                         return nullptr;
                     }
                     float original =
@@ -2833,32 +2175,30 @@ namespace renderkit {
                   host.reset(openRenderManagerDirectMode(contextParameter, p2));
                 }
                 if (host == nullptr) {
-                  std::cerr << "createRenderManager: Could not open the"
-                    << " requested harnessed DirectMode display" << std::endl;
+                  if (m_log) m_log->error() << "createRenderManager: Could not open the"
+                    << " requested harnessed DirectMode display";
                 }
 
                 ret.reset(
                   new RenderManagerD3D11OpenGL(contextParameter, p, std::move(host)));
 #else
-                std::cerr
+                if (m_log) m_log->error()
                     << "createRenderManager: D3D11OpenGL render library not "
-                       "compiled in"
-                    << std::endl;
+                       "compiled in";
                 return nullptr;
 #endif
             } else {
 #ifdef RM_USE_OPENGL
-              ret.reset(new RenderManagerOpenGL(contextParameter, p));
+                ret.reset(new RenderManagerOpenGL(contextParameter, p));
 #else
-                std::cerr << "createRenderManager: OpenGL render library not "
-                             "compiled in"
-                          << std::endl;
+                if (m_log) m_log->error() << "createRenderManager: OpenGL render library not "
+                             "compiled in";
                 return nullptr;
 #endif
             }
         } else {
-            std::cerr << "createRenderManager: Unrecognized render library: "
-                      << p.m_renderLibrary << std::endl;
+            if (m_log) m_log->error() << "createRenderManager: Unrecognized render library: "
+                      << p.m_renderLibrary;
             return nullptr;
         }
 
